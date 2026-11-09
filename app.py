@@ -7,12 +7,12 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="KAIROS LIVE V3.3", page_icon="🔴", layout="wide")
-TZ = ZoneInfo("America/Toronto")
+st.set_page_config(page_title="KAIROS LIVE V3.4", page_icon="🔴", layout="wide")
 BASE = "https://v3.football.api-sports.io"
+TZ = ZoneInfo("America/Toronto")
 
 
-def secret_key():
+def key():
     try:
         return str(st.secrets.get("API_FOOTBALL_KEY", "")).strip()
     except Exception:
@@ -20,272 +20,613 @@ def secret_key():
 
 
 @st.cache_data(ttl=90, show_spinner=False)
-def api_get(endpoint, key, params=()):
+def api_call(endpoint, params, api_key):
     try:
-        response = requests.get(
+        r = requests.get(
             BASE + endpoint,
-            headers={"x-apisports-key": key},
             params=dict(params),
-            timeout=22,
+            headers={"x-apisports-key": api_key},
+            timeout=25,
         )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("errors"):
-            return {"error": str(payload["errors"]), "data": [], "quota": {}}
+        r.raise_for_status()
+        body = r.json()
+        if body.get("errors"):
+            return {
+                "items": [],
+                "error": str(body["errors"]),
+                "quota": r.headers.get("x-ratelimit-requests-remaining"),
+            }
         return {
+            "items": body.get("response") or [],
             "error": "",
-            "data": payload.get("response") or [],
-            "quota": {
-                "remaining": response.headers.get("x-ratelimit-requests-remaining"),
-                "limit": response.headers.get("x-ratelimit-requests-limit"),
-            },
+            "quota": r.headers.get("x-ratelimit-requests-remaining"),
         }
-    except (requests.RequestException, ValueError) as exc:
-        return {"error": str(exc), "data": [], "quota": {}}
+    except (requests.RequestException, ValueError) as e:
+        return {"items": [], "error": str(e), "quota": None}
 
 
-def request(endpoint, **params):
-    key = secret_key()
-    if not key:
-        return {"error": "Clé API_FOOTBALL_KEY absente des secrets Streamlit.", "data": [], "quota": {}}
-    frozen = tuple(sorted((k, str(v)) for k, v in params.items()))
-    # st.cache_data ne compte pas un appel réseau lorsque les arguments sont identiques.
-    if "seen_calls" not in st.session_state:
-        st.session_state.seen_calls = set()
-    if "local_calls" not in st.session_state:
-        st.session_state.local_calls = 0
-    today = datetime.now(TZ).date().isoformat()
-    if st.session_state.get("counter_day") != today:
-        st.session_state.counter_day = today
-        st.session_state.local_calls = 0
-        st.session_state.seen_calls = set()
-    token = (endpoint, frozen)
-    if token not in st.session_state.seen_calls:
-        if st.session_state.local_calls >= st.session_state.budget:
-            return {"error": "Budget local atteint. Réessaie demain ou augmente le budget.", "data": [], "quota": {}}
-        st.session_state.seen_calls.add(token)
-        st.session_state.local_calls += 1
-    result = api_get(endpoint, key, frozen)
-    if result["quota"].get("remaining") is not None:
-        st.session_state.remaining = result["quota"]["remaining"]
+def fetch(endpoint, **kwargs):
+    params = tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    signature = (endpoint, params)
+
+    if signature not in st.session_state.seen:
+        if st.session_state.calls >= st.session_state.budget:
+            return {
+                "items": [],
+                "error": "Budget local atteint.",
+                "quota": None,
+            }
+        st.session_state.seen.add(signature)
+        st.session_state.calls += 1
+
+    result = api_call(endpoint, params, key())
+
+    if result["quota"] is not None:
+        st.session_state.quota = result["quota"]
+
     return result
 
 
-def number(v):
+def numeric(value):
     try:
-        return float(v)
-    except (ValueError, TypeError):
+        return float(str(value).replace("%", "").replace(",", "."))
+    except (TypeError, ValueError):
         return None
 
 
-def stat_value(stats, names):
-    for item in stats or []:
-        if str(item.get("type", "")).strip().lower() in names:
-            val = item.get("value")
-            if isinstance(val, str):
-                val = val.replace("%", "").strip()
-            return number(val)
+def info(match):
+    fixture = match.get("fixture") or {}
+    teams = match.get("teams") or {}
+    goals = match.get("goals") or {}
+    status = fixture.get("status") or {}
+
+    home = (teams.get("home") or {}).get("name", "Domicile")
+    away = (teams.get("away") or {}).get("name", "Extérieur")
+
+    h, a = goals.get("home"), goals.get("away")
+
+    return {
+        "id": fixture.get("id"),
+        "name": f"{home} vs {away}",
+        "minute": int(numeric(status.get("elapsed")) or 0),
+        "score": f"{h if h is not None else '?'}-{a if a is not None else '?'}",
+        "goals": h + a if isinstance(h, int) and isinstance(a, int) else None,
+        "league": (match.get("league") or {}).get("name", ""),
+    }
+
+
+def stats(fixture_id):
+    result = fetch("/fixtures/statistics", fixture=fixture_id)
+
+    if result["error"] or len(result["items"]) < 2:
+        return None, result["error"] or "Statistiques indisponibles"
+
+    rows = [
+        (x.get("statistics") or [])
+        for x in result["items"][:2]
+    ]
+
+    def extract(row, name):
+        for item in row:
+            if str(item.get("type", "")).strip().lower() == name:
+                return numeric(item.get("value"))
+        return None
+
+    output = {}
+
+    for name, label in [
+        ("corner kicks", "corners"),
+        ("shots on goal", "target"),
+        ("total shots", "shots"),
+    ]:
+        values = [extract(row, name) for row in rows]
+
+        output[label] = (
+            tuple(int(v) for v in values)
+            if all(v is not None for v in values)
+            else None
+        )
+
+    return output, ""
+
+
+def market_kind(name):
+    n = re.sub(
+        r"\s+", " ", name.lower().replace("-", " ")
+    ).strip()
+
+    excluded = (
+        "half", "1h", "2h", "period", "team",
+        "home", "away", "asian", "race",
+        "exact", "odd/even", "odd even",
+        "first", "second",
+    )
+
+    if any(word in n for word in excluded):
+        return None
+
+    if "corner" in n and any(
+        word in n
+        for word in (
+            "over", "under", "total",
+            "match corner", "corner kicks",
+        )
+    ):
+        return "corners"
+
+    if "corner" in n:
+        return None
+
+    if any(
+        word in n
+        for word in (
+            "over/under", "over under",
+            "match goals", "total goals",
+            "goals over", "goal line",
+            "over/under line",
+        )
+    ):
+        return "buts"
+
     return None
 
 
-def fixture_info(item):
-    f = item.get("fixture") or {}
-    teams = item.get("teams") or {}
-    goals = item.get("goals") or {}
-    score = item.get("score") or {}
-    elapsed = number((f.get("status") or {}).get("elapsed")) or 0
-    home = (teams.get("home") or {}).get("name", "Domicile")
-    away = (teams.get("away") or {}).get("name", "Extérieur")
-    gh = goals.get("home")
-    ga = goals.get("away")
-    return {
-        "id": f.get("id"), "name": f"{home} vs {away}",
-        "league": (item.get("league") or {}).get("name", ""),
-        "minute": int(elapsed), "score": f"{gh if gh is not None else '?'}-{ga if ga is not None else '?'}",
-        "goals": (gh + ga) if isinstance(gh, int) and isinstance(ga, int) else None,
-        "halftime": (score.get("halftime") or {}),
-        "status": (f.get("status") or {}).get("short", ""),
-    }
+def parse_selection(value, market):
+    raw = str(
+        value.get("value")
+        or value.get("label")
+        or value.get("name")
+        or ""
+    )
+
+    m = re.search(
+        r"\b(over|under)\s*[:=\-]?\s*(\d+(?:[.,]\d+)?)\b",
+        raw,
+        re.I,
+    )
+
+    if m:
+        side = m.group(1).title()
+        line = numeric(m.group(2))
+    else:
+        side_match = re.search(
+            r"\b(over|under)\b", raw, re.I
+        )
+        side = (
+            side_match.group(1).title()
+            if side_match else None
+        )
+
+        line = numeric(
+            value.get("handicap") or value.get("line")
+        )
+
+        if line is None:
+            line_match = re.search(
+                r"\b(\d+(?:[.,]\d+)?)\b", market
+            )
+            line = (
+                numeric(line_match.group(1))
+                if line_match else None
+            )
+
+    odd = numeric(
+        value.get("odd") or value.get("odds")
+    )
+
+    if (
+        side is None
+        or line is None
+        or odd is None
+        or odd <= 1
+    ):
+        return None
+
+    return side, line, odd
 
 
-def stats_for(fixture_id):
-    res = request("/fixtures/statistics", fixture=fixture_id)
-    if res["error"] or len(res["data"]) < 2:
-        return None, res["error"] or "Statistiques absentes"
-    a = res["data"][0].get("statistics") or []
-    b = res["data"][1].get("statistics") or []
-    fields = {
-        "corners": {"corner kicks"},
-        "shots": {"total shots"},
-        "on_target": {"shots on goal"},
-    }
-    out = {}
-    for field, aliases in fields.items():
-        x, y = stat_value(a, aliases), stat_value(b, aliases)
-        out[field] = (int(x), int(y)) if x is not None and y is not None else None
-    return out, ""
+def odds(fixture_id):
+    result = fetch("/odds/live", fixture=fixture_id)
 
+    if result["error"]:
+        return [], [], result["error"]
 
-def extract_live_odds(fixture_id):
-    res = request("/odds/live", fixture=fixture_id)
-    if res["error"]:
-        return [], res["error"]
-    selections = []
-    for match in res["data"]:
-        for bookmaker in match.get("bookmakers") or []:
-            book_name = bookmaker.get("name", "Source inconnue")
+    found = []
+    names = set()
+
+    for entry in result["items"]:
+        for bookmaker in entry.get("bookmakers") or []:
+            book = bookmaker.get(
+                "name", "Source inconnue"
+            )
+
             for bet in bookmaker.get("bets") or []:
-                market = str(bet.get("name", ""))
-                low = market.lower()
-                # Exclure les périodes et marchés spécifiques aux équipes.
-                if any(x in low for x in ("1st half", "2nd half", "first half", "second half", "half time", "halftime", "team", "home", "away", "asian", "race", "exact", "odd/even")):
+                name = str(bet.get("name") or "")
+                names.add(name)
+
+                kind = market_kind(name)
+
+                if not kind:
                     continue
-                if "corner" in low and any(x in low for x in ("total", "over/under", "match corners")):
-                    kind = "corners"
-                elif ("goal" in low or "over/under" in low) and "corner" not in low:
-                    kind = "buts"
-                else:
-                    continue
-                for val in bet.get("values") or []:
-                    raw = str(val.get("value") or val.get("label") or "")
-                    m = re.search(r"\b(over|under)\s*([0-9]+(?:[.,][0-9]+)?)\b", raw, re.I)
-                    if not m:
-                        continue
-                    side, line = m.group(1).title(), float(m.group(2).replace(",", "."))
-                    odd = number(val.get("odd") or val.get("odds"))
-                    if odd is None or odd <= 1:
-                        continue
-                    selections.append({"kind": kind, "side": side, "line": line, "odd": odd, "book": book_name, "market": market})
-    return selections, ""
+
+                for value in bet.get("values") or []:
+                    parsed = parse_selection(value, name)
+
+                    if parsed:
+                        side, line, odd = parsed
+
+                        found.append({
+                            "kind": kind,
+                            "side": side,
+                            "line": line,
+                            "odd": odd,
+                            "book": book,
+                            "market": name,
+                        })
+
+    return found, sorted(names), ""
 
 
-def fmt(x):
-    return f"{x:g}"
+def status_text(selection, current):
+    if current is None:
+        return "Progression indisponible"
 
+    threshold = math.floor(selection["line"]) + 1
 
-def progress(selection, goals, corners):
-    total = goals if selection["kind"] == "buts" else corners
-    if total is None:
-        return "Progression indisponible : statistique manquante", False
-    line = selection["line"]
-    # Nombre entier minimal qui dépasse la ligne.
-    needed_to_over = math.floor(line) + 1
     if selection["side"] == "Over":
-        missing = max(0, needed_to_over - total)
-        return (f"{total} actuellement · {missing} supplémentaire(s) nécessaire(s)" if missing else f"{total} actuellement · seuil déjà franchi"), missing == 0
-    remaining = max(0, needed_to_over - total)
-    if remaining == 0:
-        return f"{total} actuellement · seuil déjà franchi (Under compromis)", True
-    return f"{total} actuellement · {remaining} supplémentaire(s) avant de dépasser la ligne", False
+        missing = max(0, threshold - current)
+
+        if missing:
+            return (
+                f"{current} actuellement · "
+                f"{missing} encore nécessaire(s)"
+            )
+
+        return (
+            f"{current} actuellement · "
+            "seuil déjà atteint"
+        )
+
+    if current >= threshold:
+        return (
+            f"{current} actuellement · "
+            "seuil dépassé : Under perdant "
+            "si total match complet"
+        )
+
+    return (
+        f"{current} actuellement · "
+        f"{threshold - current} supplémentaire(s) "
+        "avant que l'Under soit dépassé"
+    )
 
 
-def render_match(item, with_odds):
-    info = fixture_info(item)
+def show_match(match, origin):
+    data = info(match)
+    fid = data["id"]
+
+    if fid is None:
+        return
+
     with st.container(border=True):
-        st.subheader(f"{info['name']} | {info['minute']}' | {info['score']}")
-        st.caption(f"{info['league']} · ID {info['id']} · {info['status']}")
-        stats, err = stats_for(info["id"])
-        if stats is None:
-            st.warning(f"Statistiques indisponibles : {err}")
+        st.subheader(
+            f"{data['name']} | "
+            f"{data['minute']}' | "
+            f"{data['score']}"
+        )
+
+        st.caption(
+            f"{data['league']} · ID {fid}"
+        )
+
+        s, error = stats(fid)
+
+        if error:
+            st.warning(error)
             return
-        corners = sum(stats["corners"]) if stats["corners"] is not None else None
-        a, b, c = st.columns(3)
-        a.metric("⚽ Buts", info["goals"] if info["goals"] is not None else "?")
-        b.metric("🚩 Corners", corners if corners is not None else "?")
-        c.metric("Tirs cadrés", " - ".join(map(str, stats["on_target"])) if stats["on_target"] else "N/D")
-        if not with_odds:
-            st.caption("Active « Charger les cotes » pour consulter les marchés, sans appel API supplémentaire avant cette action.")
-            if st.button("💰 Charger les cotes live", key=f"odds_{info['id']}"):
-                st.session_state[f"show_{info['id']}"] = True
-        if with_odds or st.session_state.get(f"show_{info['id']}"):
-            odds, odds_error = extract_live_odds(info["id"])
-            if odds_error:
-                st.warning(f"Cotes indisponibles : {odds_error}")
-                return
-            if not odds:
-                st.info("Aucun marché Over/Under match complet avec ligne explicite n'a été trouvé.")
-                return
-            for kind, emoji in (("buts", "⚽"), ("corners", "🚩")):
-                group = [x for x in odds if x["kind"] == kind]
-                with st.expander(f"{emoji} TOTAL {kind.upper()} — {len(group)} sélections", expanded=bool(group)):
-                    if not group:
-                        st.caption("Aucune cote compatible.")
-                    for s in sorted(group, key=lambda x: (x["line"], x["side"], x["book"])):
-                        desc, crossed = progress(s, info["goals"], corners)
-                        st.markdown(f"**{emoji} {s['side'].upper()} {fmt(s['line'])} {kind.upper()} — @{s['odd']:.2f}**")
-                        st.caption(f"Match complet (selon marché API : {s['market']}) · {s['book']} · {desc}")
-                        if crossed:
-                            st.caption("⚠️ Ligne déjà franchie : vérifier si le marché est encore ouvert ou s'il s'agit d'un autre règlement.")
-                        st.divider()
-            st.info("Ces cotes sont des marchés à examiner, pas des picks à valeur prouvée. Une EV fiable exige un modèle probabiliste validé et des cotes à jour.")
+
+        corners = (
+            sum(s["corners"])
+            if s["corners"] is not None
+            else None
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "⚽ Buts",
+            data["goals"]
+            if data["goals"] is not None
+            else "N/D",
+        )
+
+        c2.metric(
+            "🚩 Corners",
+            corners
+            if corners is not None
+            else "N/D",
+        )
+
+        c3.metric(
+            "Tirs cadrés",
+            " - ".join(map(str, s["target"]))
+            if s["target"] else "N/D",
+        )
+
+        button_key = f"load_{origin}_{fid}"
+
+        if st.button(
+            "💰 Charger les cotes live",
+            key=button_key,
+        ):
+            st.session_state[f"loaded_{fid}"] = True
+
+        if not st.session_state.get(f"loaded_{fid}"):
+            st.caption(
+                "Les cotes ne sont demandées "
+                "qu'après avoir appuyé sur le bouton."
+            )
+            return
+
+        selections, names, odds_error = odds(fid)
+
+        if odds_error:
+            st.warning(odds_error)
+            return
+
+        markets = (
+            ("buts", "⚽", data["goals"]),
+            ("corners", "🚩", corners),
+        )
+
+        for kind, emoji, current in markets:
+            group = [
+                x for x in selections
+                if x["kind"] == kind
+            ]
+
+            with st.expander(
+                f"{emoji} TOTAL {kind.upper()} "
+                f"— {len(group)} cote(s)",
+                expanded=bool(group),
+            ):
+                if not group:
+                    st.info(
+                        "Aucune sélection compatible "
+                        "trouvée pour ce marché."
+                    )
+
+                for x in sorted(
+                    group,
+                    key=lambda a: (
+                        a["line"],
+                        a["side"],
+                        a["odd"],
+                    ),
+                ):
+                    st.markdown(
+                        f"**{emoji} {x['side'].upper()} "
+                        f"{x['line']:g} {kind.upper()} "
+                        f"— @{x['odd']:.2f}**"
+                    )
+
+                    st.caption(
+                        f"{status_text(x, current)} · "
+                        f"{x['book']} · "
+                        f"Marché API : {x['market']}"
+                    )
+
+                    st.divider()
+
+        with st.expander(
+            f"🔧 Diagnostic des marchés reçus "
+            f"({len(names)})"
+        ):
+            if names:
+                st.code(
+                    "\n".join(names),
+                    language="text",
+                )
+            else:
+                st.info(
+                    "L'API n'a renvoyé aucun "
+                    "marché pour ce match."
+                )
+
+        st.caption(
+            "Attention : une cote affichée ne "
+            "constitue pas une preuve de valeur. "
+            "Vérifie sa période, son règlement "
+            "et son actualité."
+        )
 
 
-st.title("🔴 KAIROS LIVE V3.3")
-st.caption("Soccer live · Over/Under buts et corners · Heure du Québec · Mode économe")
-if "budget" not in st.session_state:
-    st.session_state.budget = 60
-if "remaining" not in st.session_state:
-    st.session_state.remaining = "Inconnu"
+for k, default in {
+    "budget": 60,
+    "calls": 0,
+    "seen": set(),
+    "quota": "Inconnu",
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = default
+
+today = datetime.now(TZ).date().isoformat()
+
+if st.session_state.get("day") != today:
+    st.session_state.day = today
+    st.session_state.calls = 0
+    st.session_state.seen = set()
+
+st.title("🔴 KAIROS LIVE V3.4")
+
+st.caption(
+    "Soccer live · Buts et corners · "
+    "Québec · Mode économe"
+)
 
 with st.sidebar:
     st.header("⚙️ Paramètres")
-    st.slider("Budget local d'appels / jour", 5, 100, key="budget")
-    match_limit = st.slider("Matchs analysés par scan", 1, 10, 3)
-    min_minute, max_minute = st.slider("Minutes du match", 0, 120, (20, 85))
-    st.metric("Appels estimés dans cette session", st.session_state.get("local_calls", 0))
-    st.caption(f"Budget local restant : {max(0, st.session_state.budget - st.session_state.get('local_calls', 0))}")
-    st.caption(f"Quota restant annoncé par l'API : {st.session_state.remaining}")
-    st.warning("Le compteur local est indicatif : il peut se réinitialiser au redémarrage et n'inclut pas les autres applications. Seul le fournisseur connaît le quota réel.")
-    if st.button("Vider le cache API"):
-        api_get.clear()
-        st.session_state.seen_calls = set()
-        st.info("Cache vidé. Les prochains chargements pourront consommer des requêtes.")
 
-if not secret_key():
-    st.error('Ajoute ta clé dans Streamlit → Manage app → Settings → Secrets, au format : API_FOOTBALL_KEY = "ta_cle"')
+    st.slider(
+        "Budget local d'appels / jour",
+        5, 100,
+        key="budget",
+    )
+
+    limit = st.slider(
+        "Matchs analysés par scan",
+        1, 10, 3,
+    )
+
+    minute_min, minute_max = st.slider(
+        "Minutes du match",
+        0, 120, (20, 85),
+    )
+
+    st.metric(
+        "Appels estimés (session)",
+        st.session_state.calls,
+    )
+
+    st.caption(
+        "Budget local restant : "
+        f"{max(0, st.session_state.budget - st.session_state.calls)}"
+    )
+
+    st.caption(
+        f"Quota API annoncé : "
+        f"{st.session_state.quota}"
+    )
+
+    st.warning(
+        "Le compteur local est indicatif "
+        "et ne mesure pas exactement "
+        "le quota fournisseur."
+    )
+
+    if st.button(
+        "Vider le cache API",
+        key="clear_cache",
+    ):
+        api_call.clear()
+        st.info(
+            "Cache vidé. Les prochains "
+            "chargements peuvent consommer "
+            "des requêtes."
+        )
+
+if not key():
+    st.error(
+        'Ajoute API_FOOTBALL_KEY = "ta_cle" '
+        "dans les Secrets Streamlit."
+    )
     st.stop()
 
-auto_tab, manual_tab, help_tab = st.tabs(["📡 Automatique", "🔎 Manuel", "📘 Fonctionnement"])
-with auto_tab:
-    st.subheader("Scanner les matchs en direct")
-    st.caption("La liste live est mise en cache 90 secondes. Les statistiques et les cotes sont mises en cache 90 secondes également. Les cotes ne sont chargées qu'à la demande.")
-    if st.button("🔄 LANCER LE SCAN", type="primary", use_container_width=True):
-        live = request("/fixtures", live="all")
-        if live["error"]:
-            st.error(live["error"])
+auto, manual, guide = st.tabs([
+    "📡 Automatique",
+    "🔎 Manuel",
+    "📘 Aide",
+])
+
+with auto:
+    st.subheader("Scanner les matchs live")
+
+    if st.button(
+        "🔄 LANCER LE SCAN",
+        type="primary",
+        key="scan_auto",
+    ):
+        result = fetch(
+            "/fixtures",
+            live="all",
+        )
+
+        if result["error"]:
+            st.error(result["error"])
         else:
-            pool = [x for x in live["data"] if min_minute <= fixture_info(x)["minute"] <= max_minute]
-            st.session_state.auto_matches = pool[:match_limit]
-            st.session_state.auto_total = len(pool)
+            eligible = [
+                m for m in result["items"]
+                if minute_min <= info(m)["minute"] <= minute_max
+            ]
+
+            st.session_state.auto_matches = eligible[:limit]
+            st.session_state.auto_total = len(eligible)
+
     if "auto_matches" in st.session_state:
-        st.caption(f"{len(st.session_state.auto_matches)} match(s) sélectionné(s) sur {st.session_state.get('auto_total', 0)} dans la plage choisie.")
-        if not st.session_state.auto_matches:
-            st.info("Aucun match dans cette plage de minutes.")
+        st.caption(
+            f"{len(st.session_state.auto_matches)} "
+            f"match(s) sur "
+            f"{st.session_state.get('auto_total', 0)} "
+            "admissibles"
+        )
+
         for match in st.session_state.auto_matches:
-            render_match(match, False)
+            show_match(match, "auto")
 
-with manual_tab:
-    st.subheader("Analyser un match live précis")
-    if st.button("🔍 Actualiser la liste des matchs"):
-        live = request("/fixtures", live="all")
-        if live["error"]:
-            st.error(live["error"])
+with manual:
+    st.subheader("Analyser un match précis")
+
+    if st.button(
+        "🔍 Charger les matchs live",
+        key="manual_refresh",
+    ):
+        result = fetch(
+            "/fixtures",
+            live="all",
+        )
+
+        if result["error"]:
+            st.error(result["error"])
         else:
-            st.session_state.live_list = live["data"]
-    if st.session_state.get("live_list"):
-        matches = st.session_state.live_list
-        choices = {f"{fixture_info(x)['name']} | {fixture_info(x)['minute']}' | ID {fixture_info(x)['id']}": x for x in matches}
-        chosen = st.selectbox("Match", list(choices))
-        if st.button("🔎 ANALYSER CE MATCH", type="primary"):
-            st.session_state.manual_match = choices[chosen]
+            st.session_state.manual_list = result["items"]
+
+    if st.session_state.get("manual_list"):
+        options = {
+            (
+                f"{info(m)['name']} | "
+                f"{info(m)['minute']}' | "
+                f"ID {info(m)['id']}"
+            ): m
+            for m in st.session_state.manual_list
+        }
+
+        selected = st.selectbox(
+            "Match",
+            list(options),
+            key="manual_selection",
+        )
+
+        if st.button(
+            "🔎 ANALYSER",
+            key="manual_analyze",
+        ):
+            st.session_state.manual_match = options[selected]
+
     if st.session_state.get("manual_match"):
-        render_match(st.session_state.manual_match, False)
+        show_match(
+            st.session_state.manual_match,
+            "manual",
+        )
 
-with help_tab:
-    st.markdown("""
-**Lecture des marchés :** « ⚽ OVER 3.5 BUTS » signifie au moins 4 buts dans le match. « 🚩 UNDER 10.5 CORNERS » signifie au maximum 10 corners dans le match.
+with guide:
+    st.write(
+        "⚽ OVER 3.5 BUTS : au moins "
+        "4 buts au total. "
+        "🚩 UNDER 10.5 CORNERS : "
+        "au maximum 10 corners au total."
+    )
 
-**Limites :** l'API peut fournir des statistiques manquantes, des cotes retardées, des marchés sans ligne explicite ou des marchés de période différente. Les marchés ambigus sont exclus. Aucune probabilité de victoire ni EV n'est inventée à partir des seules statistiques live.
+    st.write(
+        "Les marchés ambigus ou sans ligne "
+        "explicite sont exclus. "
+        "Le diagnostic montre les noms exacts "
+        "renvoyés par l'API."
+    )
 
-**Économie d'API :** lance peu de scans, limite le nombre de matchs et charge les cotes seulement pour les matchs intéressants. Le cache est partagé côté serveur, mais le compteur local n'est pas un compteur de facturation exact.
-""")
+    st.write(
+        "Le cache de 90 secondes limite "
+        "les appels réseau. "
+        "Les estimations d'appels locales "
+        "peuvent surestimer ou sous-estimer "
+        "la consommation réelle."
+    )
