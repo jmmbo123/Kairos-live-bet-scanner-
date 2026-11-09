@@ -1,7 +1,7 @@
 
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -9,886 +9,318 @@ import streamlit as st
 
 BASE = "https://v3.football.api-sports.io"
 TZ = ZoneInfo("America/Toronto")
+st.set_page_config(page_title="KAIROS LIVE V3.6", page_icon="🔴", layout="wide")
 
-st.set_page_config(
-    page_title="KAIROS LIVE V3.5",
-    page_icon="🔴",
-    layout="wide",
-)
-
-# =====================================
-# SESSION
-# =====================================
-
-if "calls" not in st.session_state:
-    st.session_state.calls = 0
-
-if "remaining" not in st.session_state:
-    st.session_state.remaining = None
-
-if "results" not in st.session_state:
-    st.session_state.results = []
-
-if "live" not in st.session_state:
-    st.session_state.live = []
-
-if "last_scan" not in st.session_state:
-    st.session_state.last_scan = None
+for key, default in {
+    "calls": 0, "remaining": None, "live": [], "results": [],
+    "last_scan": None, "manual_result": None, "odds_saved": {},
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
-# =====================================
-# API + CACHE
-# =====================================
-
-@st.cache_data(ttl=180, show_spinner=False)
-def api_get(endpoint, fixture=None, api_key=""):
-    params = {"fixture": fixture} if fixture is not None else {}
-
-    if endpoint == "fixtures":
-        params = {"live": "all"}
-
+def number(x, default=None):
     try:
-        r = requests.get(
-            f"{BASE}/{endpoint}",
-            headers={"x-apisports-key": api_key},
-            params=params,
-            timeout=18,
-        )
-        r.raise_for_status()
-
-        data = r.json()
-        remaining = r.headers.get(
-            "x-ratelimit-requests-remaining"
-        )
-
-        if data.get("errors"):
-            return {
-                "error": str(data["errors"]),
-                "response": [],
-                "remaining": remaining,
-            }
-
-        return {
-            "response": data.get("response", []),
-            "error": None,
-            "remaining": remaining,
-        }
-
-    except (requests.RequestException, ValueError) as exc:
-        return {
-            "response": [],
-            "error": str(exc),
-            "remaining": None,
-        }
-
-
-def request_data(endpoint, fixture=None):
-    key = st.secrets.get("API_FOOTBALL_KEY", "")
-
-    if not key:
-        return {
-            "response": [],
-            "error": "Clé API_FOOTBALL_KEY absente dans Streamlit Secrets.",
-            "remaining": None,
-        }
-
-    result = api_get(
-        endpoint=endpoint,
-        fixture=fixture,
-        api_key=key,
-    )
-
-    # Compteur conservateur : inclut les accès au cache.
-    st.session_state.calls += 1
-
-    if result["remaining"] is not None:
-        st.session_state.remaining = result["remaining"]
-
-    return result
-
-
-# =====================================
-# OUTILS
-# =====================================
-
-def num(value, default=0):
-    try:
-        return float(value)
+        if isinstance(x, str):
+            x = x.replace("%", "").strip()
+        v = float(x)
+        return v if math.isfinite(v) else default
     except (TypeError, ValueError):
         return default
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def api_get(endpoint, fixture, api_key):
+    params = {"live": "all"} if endpoint == "fixtures" else {"fixture": fixture}
+    try:
+        response = requests.get(
+            f"{BASE}/{endpoint}",
+            headers={"x-apisports-key": api_key},
+            params=params, timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return {
+            "response": payload.get("response") or [],
+            "error": str(payload.get("errors")) if payload.get("errors") else None,
+            "remaining": response.headers.get("x-ratelimit-requests-remaining"),
+        }
+    except (requests.RequestException, ValueError) as exc:
+        return {"response": [], "error": str(exc), "remaining": None}
+
+
+def request_data(endpoint, fixture=None):
+    key = st.secrets.get("API_FOOTBALL_KEY", "")
+    if not key:
+        return {"response": [], "error": "Clé API_FOOTBALL_KEY absente dans Secrets.", "remaining": None}
+    # Cache_data évite un nouvel appel HTTP pour une requête identique durant 180 s.
+    # Le compteur est volontairement une borne haute, pas le quota officiel.
+    result = api_get(endpoint, fixture, key)
+    st.session_state.calls += 1
+    if result["remaining"] is not None:
+        st.session_state.remaining = result["remaining"]
+    return result
+
+
+def fixture_id(f):
+    return f.get("fixture", {}).get("id")
+
+
 def fixture_name(f):
-    home = f.get("teams", {}).get("home", {}).get("name", "?")
-    away = f.get("teams", {}).get("away", {}).get("name", "?")
-    return f"{home} vs {away}"
+    teams = f.get("teams") or {}
+    return f"{(teams.get('home') or {}).get('name', '?')} vs {(teams.get('away') or {}).get('name', '?')}"
 
 
 def minute(f):
-    return int(
-        num(
-            f.get("fixture", {})
-            .get("status", {})
-            .get("elapsed")
-        )
-    )
+    return int(number(((f.get("fixture") or {}).get("status") or {}).get("elapsed"), 0))
 
 
-def stats_summary(items):
-    out = {}
+def score(f):
+    g = f.get("goals") or {}
+    return f"{int(number(g.get('home'), 0))}-{int(number(g.get('away'), 0))}"
 
-    for team in items or []:
+
+def summary_stats(stats):
+    data = {"shots on goal": 0, "total shots": 0, "corner kicks": 0}
+    present = set()
+    for team in stats or []:
         for item in team.get("statistics") or []:
-            label = str(item.get("type", "")).lower()
-
-            if label in (
-                "shots on goal",
-                "total shots",
-                "corner kicks",
-            ):
-                out[label] = (
-                    out.get(label, 0)
-                    + num(item.get("value"))
-                )
-
-    return out
+            name = str(item.get("type", "")).strip().lower()
+            if name in data:
+                value = number(item.get("value"))
+                if value is not None:
+                    data[name] += max(0, value)
+                    present.add(name)
+    return data, present
 
 
-def score_goals(f):
-    goals = f.get("goals") or {}
-
-    return (
-        int(num(goals.get("home")))
-        + int(num(goals.get("away")))
-    )
-
-
-# =====================================
-# MARCHÉS OVER / UNDER
-# =====================================
-
-def parse_market(market, home, away):
-    name = str(market.get("name", "")).strip()
-    low = name.lower()
-
-    # Exclure les marchés hors match complet.
-    excluded = (
-        "1st half",
-        "2nd half",
-        "first half",
-        "second half",
-        "home",
-        "away",
-        "team",
-        "asian",
-        "race",
-        "odd/even",
-        "exact",
-        "3way",
-        "3-way",
-    )
-
+def classify_market(name):
+    low = re.sub(r"\s+", " ", str(name).lower()).strip()
+    excluded = ("1st half", "2nd half", "first half", "second half", "half time",
+                "halftime", "home", "away", "team", "asian", "race", "odd/even",
+                "exact", "3way", "3-way", "3 way", "1h", "2h")
     if any(x in low for x in excluded):
         return None
+    goals = {"goals over/under", "match goals", "over/under", "total goals",
+             "over/under line", "goals over under"}
+    corners = {"total corners", "match corners", "corners over/under",
+               "corner kicks over/under", "corners", "total corner kicks"}
+    if low in goals:
+        return "Buts"
+    if low in corners:
+        return "Corners"
+    return None
 
-    if low in (
-        "goals over/under",
-        "match goals",
-        "over/under",
-        "total goals",
-        "over/under line",
-    ):
-        kind = "⚽ Buts"
 
-    elif low in (
-        "total corners",
-        "match corners",
-        "corners over/under",
-        "corner kicks over/under",
-        "corners",
-    ):
-        kind = "🚩 Corners"
+def parse_odds(response):
+    output, market_count = [], 0
+    for block in response or []:
+        for book in block.get("bookmakers") or []:
+            bookmaker = book.get("name") or "Bookmaker inconnu"
+            for market in book.get("bets") or []:
+                market_count += 1
+                kind = classify_market(market.get("name", ""))
+                if not kind:
+                    continue
+                for item in market.get("values") or []:
+                    raw = str(item.get("value", "")).strip()
+                    match = re.fullmatch(r"(Over|Under)\s+(\d+(?:[.,]\d+)?)", raw, re.I)
+                    odd = number(item.get("odd"))
+                    if not match or odd is None or odd <= 1:
+                        continue
+                    line = float(match.group(2).replace(",", "."))
+                    # Les lignes entières peuvent être remboursées (push) :
+                    # le modèle binaire ci-dessous ne les évalue pas.
+                    output.append({
+                        "kind": kind, "side": match.group(1).title(),
+                        "line": line, "odd": odd, "bookmaker": bookmaker,
+                        "market": market.get("name", ""),
+                    })
+    unique = {}
+    for p in output:
+        key = (p["kind"], p["side"], p["line"], p["bookmaker"], p["odd"])
+        unique[key] = p
+    return list(unique.values()), market_count
 
-    else:
+
+def poisson_cdf(k, lam):
+    if k < 0:
+        return 0.0
+    lam = max(0.01, min(30.0, lam))
+    term = math.exp(-lam)
+    total = term
+    for i in range(1, min(k, 100) + 1):
+        term *= lam / i
+        total += term
+    return max(0.0, min(1.0, total))
+
+
+def experimental_rates(f, stats):
+    values, present = summary_stats(stats)
+    t = minute(f)
+    if t < 20 or t > 85 or len(present) < 3:
         return None
+    # Heuristiques expérimentales volontairement prudentes, NON calibrées.
+    # Taux futurs dépendants du temps et de l'activité; pas des xG.
+    time_left = max(0, 95 - t)
+    shots = values["total shots"]
+    on_target = values["shots on goal"]
+    corners = values["corner kicks"]
+    pace_goals = (0.045 * shots + 0.16 * on_target) / max(t, 25)
+    pace_corners = corners / max(t, 25)
+    goals_remaining = time_left * (0.45 * (2.5 / 95) + 0.55 * pace_goals)
+    corners_remaining = time_left * (0.45 * (9.0 / 95) + 0.55 * pace_corners)
+    return {"Buts": min(4.0, goals_remaining), "Corners": min(15.0, corners_remaining)}
 
-    picks = []
 
-    for val in market.get("values") or []:
-        label = str(val.get("value", "")).strip()
-
-        match = re.fullmatch(
-            r"(Over|Under)\s+(\d+(?:\.\d+)?)",
-            label,
-            re.I,
-        )
-
-        if not match:
+def candidate_rows(f, stats, odds):
+    rates = experimental_rates(f, stats)
+    if rates is None:
+        return [], "Statistiques insuffisantes pour une estimation expérimentale."
+    values, present = summary_stats(stats)
+    goals = sum(int(number((f.get("goals") or {}).get(k), 0)) for k in ("home", "away"))
+    current = {"Buts": goals, "Corners": int(values["corner kicks"])}
+    rows = []
+    for p in odds:
+        # Lignes .5 seulement : pas de push, pas de confusion avec lignes asiatiques.
+        if abs(p["line"] % 1 - 0.5) > 0.0001:
             continue
-
-        odd = num(val.get("odd"))
-
-        if odd <= 1 or not math.isfinite(odd):
-            continue
-
-        picks.append({
-            "kind": kind,
-            "pick": (
-                f"{match.group(1).title()} "
-                f"{match.group(2)}"
-            ),
-            "odd": odd,
-            "market": name,
-        })
-
-    return picks
+        remaining_needed = math.floor(p["line"] - current[p["kind"]])
+        prob_under = poisson_cdf(remaining_needed, rates[p["kind"]])
+        probability = prob_under if p["side"] == "Under" else 1 - prob_under
+        probability = max(0, min(1, probability))
+        ev = probability * p["odd"] - 1
+        rows.append({**p, "prob": probability, "ev": ev})
+    rows.sort(key=lambda x: x["ev"], reverse=True)
+    return rows, None
 
 
-def parse_odds(response, f):
-    if not response:
-        return (
-            [],
-            0,
-            "Aucun marché renvoyé par API-Football.",
-        )
-
-    home = (
-        f.get("teams", {})
-        .get("home", {})
-        .get("name", "")
-    )
-
-    away = (
-        f.get("teams", {})
-        .get("away", {})
-        .get("name", "")
-    )
-
-    markets = 0
-    picks = []
-
-    for block in response:
-        for bookmaker in block.get("bookmakers") or []:
-            for market in bookmaker.get("bets") or []:
-                markets += 1
-
-                parsed = parse_market(
-                    market,
-                    home,
-                    away,
-                )
-
-                if parsed:
-                    for p in parsed:
-                        p["bookmaker"] = bookmaker.get(
-                            "name",
-                            "Inconnu",
-                        )
-                        picks.append(p)
-
-    if markets == 0:
-        return (
-            [],
-            0,
-            "Réponse API présente, mais aucun marché disponible.",
-        )
-
-    if not picks:
-        return (
-            [],
-            markets,
-            "Marchés reçus, mais aucun Over/Under "
-            "match complet reconnu avec ligne explicite.",
-        )
-
-    return picks, markets, None
-
-
-# =====================================
-# AFFICHAGE DES MATCHS
-# =====================================
-
-def fixture_card(
-    f,
-    stats=None,
-    odds=None,
-    markets=None,
-    note=None,
-):
-    fid = f.get("fixture", {}).get("id", "?")
-    title = fixture_name(f)
-    goals = f.get("goals") or {}
-
-    st.subheader(
-        f"{title} | {minute(f)}' | "
-        f"{goals.get('home', 0)}-"
-        f"{goals.get('away', 0)}"
-    )
-
-    st.caption(
-        f"ID {fid} · "
-        f"{f.get('league', {}).get('name', '')}"
-    )
-
+def render_fixture(f, stats=None, error=None, show_odds=True, suffix=""):
+    fid = fixture_id(f)
+    st.subheader(f"{fixture_name(f)} | {minute(f)}' | {score(f)}")
+    st.caption(f"{(f.get('league') or {}).get('name', '')} · ID {fid}")
+    if error:
+        st.warning(error)
     if stats is not None:
-        summary = stats_summary(stats)
-
-        a, b, c = st.columns(3)
-
-        a.metric(
-            "Tirs cadrés (total)",
-            int(summary.get("shots on goal", 0)),
-        )
-
-        b.metric(
-            "Tirs (total)",
-            int(summary.get("total shots", 0)),
-        )
-
-        c.metric(
-            "Corners (total)",
-            int(summary.get("corner kicks", 0)),
-        )
-
-    if note:
-        st.info(note)
-
-    if odds is not None:
-        st.caption(
-            f"Marchés reçus : {markets or 0} | "
-            f"Sélections reconnues : {len(odds)}"
-        )
-
-        if odds:
-            for kind in ("⚽ Buts", "🚩 Corners"):
-                selection = [
-                    p for p in odds
-                    if p["kind"] == kind
-                ]
-
-                with st.expander(
-                    f"{kind} — {len(selection)} cotes"
-                ):
-                    for p in sorted(
-                        selection,
-                        key=lambda x: (
-                            x["pick"],
-                            x["bookmaker"],
-                        ),
-                    ):
-                        label = kind.split(" ", 1)[1]
-
-                        st.write(
-                            f"**{p['pick']} {label} "
-                            f"@ {p['odd']:.2f}** · "
-                            f"{p['bookmaker']} · "
-                            f"{p['market']}"
-                        )
-
-            st.warning(
-                "Aucun pick validé automatiquement : "
-                "une cote seule ne démontre pas "
-                "une valeur positive."
+        values, present = summary_stats(stats)
+        cols = st.columns(3)
+        for col, name, label in zip(cols,
+                                    ("shots on goal", "total shots", "corner kicks"),
+                                    ("Tirs cadrés", "Tirs", "Corners")):
+            col.metric(label, int(values[name]) if name in present else "N/D")
+    if not show_odds:
+        return
+    if st.button("💰 Charger les cotes live (1 appel si hors cache)", key=f"odds_button_{suffix}_{fid}"):
+        res = request_data("odds/live", fid)
+        picks, count = parse_odds(res["response"])
+        st.session_state.odds_saved[str(fid)] = (picks, count, res["error"], datetime.now(TZ).strftime("%H:%M:%S"))
+    saved = st.session_state.odds_saved.get(str(fid))
+    if not saved:
+        st.caption("Cotes non chargées : aucun appel supplémentaire effectué.")
+        return
+    odds, markets, odds_error, fetched = saved
+    st.caption(f"Cotes chargées à {fetched} · {markets} marchés reçus · {len(odds)} sélections reconnues")
+    if odds_error:
+        st.warning(odds_error)
+    if not odds:
+        st.info("Aucune cote Over/Under de match complet reconnue. Ce n'est pas une preuve d'absence de marché chez les bookmakers.")
+        return
+    rows, reason = candidate_rows(f, stats, odds)
+    if reason:
+        st.info(reason)
+    else:
+        # Ce classement est purement heuristique : pas de promesse de valeur réelle.
+        filtered = [r for r in rows if r["ev"] >= min_ev / 100 and r["prob"] >= 0.08 and r["prob"] <= 0.92]
+        if filtered:
+            top = filtered[0]
+            st.success(
+                f"🧪 MEILLEUR CANDIDAT EXPÉRIMENTAL : {top['side']} {top['line']:g} "
+                f"{top['kind']} @ {top['odd']:.2f} · {top['bookmaker']} · "
+                f"EV du modèle {top['ev']:+.1%}"
             )
-
+            st.caption("Ce n'est PAS un pick validé : probabilités non calibrées et cotes potentiellement différées.")
         else:
-            st.warning(
-                "Aucun pick vérifiable pour ce match."
-            )
+            st.info("Aucun candidat ne passe les filtres du modèle expérimental.")
+        with st.expander("📊 Classement expérimental détaillé"):
+            for r in rows[:20]:
+                st.write(f"{r['side']} {r['line']:g} {r['kind']} @ {r['odd']:.2f} · "
+                         f"{r['bookmaker']} · P modèle {r['prob']:.1%} · EV modèle {r['ev']:+.1%}")
+    for kind, emoji in (("Buts", "⚽"), ("Corners", "🚩")):
+        group = [p for p in odds if p["kind"] == kind]
+        with st.expander(f"{emoji} {kind} — {len(group)} cotes réelles reçues"):
+            for p in sorted(group, key=lambda x: (x["line"], x["side"], x["bookmaker"])):
+                st.write(f"{p['side']} {p['line']:g} {kind} @ {p['odd']:.2f} · {p['bookmaker']} · {p['market']}")
 
 
-# =====================================
-# DONNÉES DE SIMULATION
-# =====================================
-
-DEMO = [
-    {
-        "fixture": {
-            "id": 1001,
-            "status": {"elapsed": 37},
-        },
-        "teams": {
-            "home": {"name": "KAIROS Démo A"},
-            "away": {"name": "KAIROS Démo B"},
-        },
-        "goals": {
-            "home": 1,
-            "away": 0,
-        },
-        "league": {"name": "Simulation"},
-    },
-    {
-        "fixture": {
-            "id": 1002,
-            "status": {"elapsed": 62},
-        },
-        "teams": {
-            "home": {"name": "KAIROS Démo C"},
-            "away": {"name": "KAIROS Démo D"},
-        },
-        "goals": {
-            "home": 1,
-            "away": 1,
-        },
-        "league": {"name": "Simulation"},
-    },
-]
-
-DEMO_ODDS = [
-    {
-        "bookmakers": [
-            {
-                "name": "Bookmaker fictif",
-                "bets": [
-                    {
-                        "name": "Goals Over/Under",
-                        "values": [
-                            {
-                                "value": "Over 2.5",
-                                "odd": "1.85",
-                            },
-                            {
-                                "value": "Under 2.5",
-                                "odd": "1.95",
-                            },
-                        ],
-                    },
-                    {
-                        "name": "Total Corners",
-                        "values": [
-                            {
-                                "value": "Over 8.5",
-                                "odd": "1.80",
-                            },
-                            {
-                                "value": "Under 8.5",
-                                "odd": "2.00",
-                            },
-                        ],
-                    },
-                ],
-            }
-        ]
-    }
-]
-
-
-# =====================================
-# INTERFACE
-# =====================================
-
-st.title("🔴 KAIROS LIVE V3.5")
-
-st.caption(
-    "Football live · Over/Under buts et corners · "
-    "Québec · Requêtes manuelles uniquement"
-)
-
+st.title("🔴 KAIROS LIVE V3.6")
+st.caption("Matchs réels · API-Football · Québec · Aucun appel automatique · Modèle expérimental")
 with st.sidebar:
     st.header("⚙️ Paramètres")
+    limit = st.slider("Matchs maximum par scan", 1, 8, 2)
+    min_minute, max_minute = st.slider("Minutes du match", 0, 120, (20, 85))
+    min_ev = st.slider("EV expérimentale minimale (%)", 0, 40, 10, 5)
+    st.metric("Appels demandés (session, cache inclus)", st.session_state.calls)
+    st.write("Quota API annoncé :", st.session_state.remaining or "Inconnu")
+    st.caption("Le compteur local inclut les accès au cache et n'est pas le quota officiel. Cache de 180 secondes.")
+    st.warning("N'efface pas le cache inutilement : le prochain appel pourra consommer ton quota.")
 
-    demo = st.toggle(
-        "Mode démo — 0 requête API",
-        value=True,
-    )
-
-    limit = st.slider(
-        "Matchs maximum par scan",
-        1,
-        10,
-        3,
-    )
-
-    min_minute, max_minute = st.slider(
-        "Minutes de match",
-        0,
-        120,
-        (20, 85),
-    )
-
-    st.metric(
-        "Appels déclenchés dans cette session "
-        "(estimation haute)",
-        st.session_state.calls,
-    )
-
-    st.write(
-        "Quota restant annoncé :",
-        (
-            st.session_state.remaining
-            if st.session_state.remaining is not None
-            else "Inconnu"
-        ),
-    )
-
-    st.caption(
-        "Le compteur local n'est pas le quota officiel. "
-        "Les données sont mises en cache 180 secondes."
-    )
-
-    if st.button(
-        "Effacer le cache",
-        help=(
-            "Efface les réponses mémorisées. "
-            "Le prochain scan pourra utiliser le quota API."
-        ),
-    ):
-        api_get.clear()
-        st.success("Cache vidé.")
-
-
-auto, manual, guide = st.tabs([
-    "📡 Automatique",
-    "🔎 Manuel",
-    "ℹ️ Diagnostic",
-])
-
-
-# =====================================
-# MODE AUTOMATIQUE
-# =====================================
+auto, manual, guide = st.tabs(["📡 Automatique", "🔎 Manuel", "ℹ️ Diagnostic"])
 
 with auto:
-    st.write(
-        "Un scan charge la liste live et les statistiques "
-        "de quelques matchs. Les cotes ne sont chargées "
-        "que sur demande."
-    )
-
-    if st.button(
-        "🔄 LANCER LE SCAN",
-        type="primary",
-        key="scan",
-    ):
-        if demo:
-            live = DEMO
-            error = None
+    st.write("Le scan demande la liste des matchs en direct, puis les statistiques des matchs sélectionnés. Les cotes ne sont chargées que sur clic.")
+    st.caption(f"Budget maximal théorique d'un nouveau scan : {1 + limit} appels API, hors cache. Les cotes coûtent jusqu'à 1 appel supplémentaire par match.")
+    if st.button("🔄 SCANNER LES VRAIS MATCHS", type="primary", key="scan"):
+        res = request_data("fixtures")
+        if res["error"]:
+            st.error(res["error"])
         else:
-            res = request_data("fixtures")
-            live = res["response"]
-            error = res["error"]
-
-        if error:
-            st.error(error)
-
-        else:
-            candidates = [
-                f for f in live
-                if min_minute <= minute(f) <= max_minute
-            ]
-
-            st.session_state.live = live
+            st.session_state.live = res["response"]
+            matches = [f for f in res["response"] if min_minute <= minute(f) <= max_minute]
             st.session_state.results = []
-
-            for f in candidates[:limit]:
-                if demo:
-                    stat = [
-                        {
-                            "statistics": [
-                                {
-                                    "type": "Shots on Goal",
-                                    "value": 3,
-                                },
-                                {
-                                    "type": "Total Shots",
-                                    "value": 8,
-                                },
-                                {
-                                    "type": "Corner Kicks",
-                                    "value": 4,
-                                },
-                            ]
-                        }
-                    ]
-                    err = None
-
-                else:
-                    sr = request_data(
-                        "fixtures/statistics",
-                        f["fixture"]["id"],
-                    )
-
-                    stat = sr["response"]
-                    err = sr["error"]
-
-                st.session_state.results.append(
-                    (f, stat, err)
-                )
-
-            st.session_state.last_scan = (
-                datetime.now(TZ).strftime("%H:%M:%S")
-            )
-
+            for f in matches[:limit]:
+                stats_res = request_data("fixtures/statistics", fixture_id(f))
+                st.session_state.results.append((f, stats_res["response"], stats_res["error"]))
+            st.session_state.last_scan = datetime.now(TZ).strftime("%H:%M:%S")
+            if not matches:
+                st.info("Aucun match dans la plage de minutes choisie.")
     if st.session_state.last_scan:
-        st.caption(
-            "Dernier scan : "
-            + st.session_state.last_scan
-            + " (heure du Québec)"
-        )
-
-    if not st.session_state.results:
-        st.info(
-            "Aucun résultat chargé. "
-            "Clique sur LANCER LE SCAN."
-        )
-
-    for i, (f, stats, err) in enumerate(
-        st.session_state.results
-    ):
-        fid = f["fixture"]["id"]
-
+        st.caption(f"Dernier scan : {st.session_state.last_scan} (Québec)")
+    for i, (f, stats, error) in enumerate(st.session_state.results):
         with st.container(border=True):
-            fixture_card(
-                f,
-                stats,
-                note=err,
-            )
-
-            if st.button(
-                "💰 Charger les cotes live",
-                key=f"auto_odds_{fid}_{i}",
-            ):
-                if demo:
-                    odds, markets, note = parse_odds(
-                        DEMO_ODDS,
-                        f,
-                    )
-
-                else:
-                    response = request_data(
-                        "odds/live",
-                        fid,
-                    )
-
-                    odds, markets, note = parse_odds(
-                        response["response"],
-                        f,
-                    )
-
-                    if response["error"]:
-                        note = response["error"]
-
-                st.session_state[f"odds_{fid}"] = (
-                    odds,
-                    markets,
-                    note,
-                )
-
-            saved = st.session_state.get(
-                f"odds_{fid}"
-            )
-
-            if saved:
-                odds, markets, note = saved
-
-                st.caption(
-                    f"Marchés reçus : {markets} | "
-                    f"Sélections compatibles : {len(odds)}"
-                )
-
-                if note:
-                    st.warning(note)
-
-                for kind in ("⚽ Buts", "🚩 Corners"):
-                    selected = [
-                        p for p in odds
-                        if p["kind"] == kind
-                    ]
-
-                    with st.expander(
-                        f"{kind} ({len(selected)})"
-                    ):
-                        for p in selected:
-                            label = kind.split(" ", 1)[1]
-
-                            st.write(
-                                f"{p['pick']} {label} "
-                                f"@ {p['odd']:.2f} · "
-                                f"{p['bookmaker']}"
-                            )
-
-                if odds:
-                    st.info(
-                        "Lignes et cotes observées, "
-                        "pas des picks validés."
-                    )
-
-
-# =====================================
-# MODE MANUEL
-# =====================================
+            render_fixture(f, stats, error, suffix=f"auto_{i}")
 
 with manual:
-    if st.button(
-        "📋 Charger la liste des matchs",
-        key="manual_list",
-    ):
-        if demo:
-            st.session_state.live = DEMO
-
+    st.write("Utilise la liste déjà chargée, ou récupère-la une seule fois. L'analyse d'un match déclenche au maximum un appel statistiques, puis les cotes sur demande.")
+    if st.button("📋 Charger / actualiser les matchs live", key="manual_list"):
+        res = request_data("fixtures")
+        if res["error"]:
+            st.error(res["error"])
         else:
-            res = request_data("fixtures")
-
-            if res["error"]:
-                st.error(res["error"])
-            else:
-                st.session_state.live = res["response"]
-
-    live = st.session_state.live
-
-    if live:
-        choices = {
-            (
-                f"{fixture_name(f)} | "
-                f"{minute(f)}' | "
-                f"ID {f['fixture']['id']}"
-            ): f
-            for f in live
-        }
-
-        chosen = st.selectbox(
-            "Choisir un match",
-            list(choices),
-        )
-
-        f = choices[chosen]
-
-        if st.button(
-            "🔎 ANALYSER CE MATCH",
-            key="manual_stats",
-        ):
-            if demo:
-                stat = []
-                err = None
-
-            else:
-                sr = request_data(
-                    "fixtures/statistics",
-                    f["fixture"]["id"],
-                )
-
-                stat = sr["response"]
-                err = sr["error"]
-
-            st.session_state["manual_result"] = (
-                f,
-                stat,
-                err,
-            )
-
-    if st.session_state.get("manual_result"):
-        f, stat, err = st.session_state.manual_result
-        fid = f["fixture"]["id"]
-
+            st.session_state.live = res["response"]
+    choices = {f"{fixture_name(f)} | {minute(f)}' | ID {fixture_id(f)}": f for f in st.session_state.live}
+    if choices:
+        selected = st.selectbox("Match", list(choices), key="manual_select")
+        f = choices[selected]
+        if st.button("🔎 ANALYSER CE MATCH", key="manual_stats"):
+            res = request_data("fixtures/statistics", fixture_id(f))
+            st.session_state.manual_result = (f, res["response"], res["error"])
+    if st.session_state.manual_result:
+        f, stats, error = st.session_state.manual_result
         with st.container(border=True):
-            fixture_card(
-                f,
-                stat,
-                note=err,
-            )
-
-            if st.button(
-                "💰 Charger les cotes de ce match",
-                key="manual_odds",
-            ):
-                if demo:
-                    odds, markets, note = parse_odds(
-                        DEMO_ODDS,
-                        f,
-                    )
-
-                else:
-                    res = request_data(
-                        "odds/live",
-                        fid,
-                    )
-
-                    odds, markets, note = parse_odds(
-                        res["response"],
-                        f,
-                    )
-
-                    if res["error"]:
-                        note = res["error"]
-
-                st.session_state[
-                    "manual_odds_result"
-                ] = (
-                    fid,
-                    odds,
-                    markets,
-                    note,
-                )
-
-            record = st.session_state.get(
-                "manual_odds_result"
-            )
-
-            if record and record[0] == fid:
-                _, odds, markets, note = record
-
-                st.caption(
-                    f"Marchés API : {markets} | "
-                    f"Sélections : {len(odds)}"
-                )
-
-                if note:
-                    st.warning(note)
-
-                for p in odds:
-                    st.write(
-                        f"{p['kind']} · "
-                        f"**{p['pick']} @ {p['odd']:.2f}** "
-                        f"· {p['bookmaker']}"
-                    )
-
-                if odds:
-                    st.info(
-                        "Cotes affichées à titre informatif, "
-                        "pas de valeur prédictive validée."
-                    )
-
-
-# =====================================
-# DIAGNOSTIC
-# =====================================
+            render_fixture(f, stats, error, suffix="manual")
 
 with guide:
-    st.write(
-        "**0 marché** : le fournisseur ne renvoie "
-        "pas de cotes pour le match."
-    )
+    st.markdown("""
+    **Ce que la V3.6 fait réellement :** affiche les cotes live fournies par API-Football,
+    distingue clairement les buts des corners et classe des candidats avec un modèle
+    Poisson simplifié fondé sur les statistiques du match.
 
-    st.write(
-        "**Marchés reçus mais 0 sélection** : "
-        "les noms ou formats ne correspondent pas "
-        "aux marchés de match complet acceptés."
-    )
+    **Limites importantes :** les taux et probabilités sont expérimentaux, non calibrés
+    sur des résultats historiques. Une EV positive calculée n'est **pas** une preuve
+    de value bet. Les cotes live peuvent être absentes, retardées ou indisponibles
+    selon les compétitions et le forfait API. Les lignes entières et asiatiques
+    ne sont pas évaluées par ce modèle.
 
-    st.write(
-        "**Sélections disponibles** : "
-        "affichage de la ligne et de la cote, "
-        "sans inventer de probabilité de gain."
-    )
-
-    st.write(
-        "La simulation utilise des matchs et "
-        "des cotes fictifs."
-    )
-
-    st.write(
-        "Les requêtes réelles sont uniquement "
-        "déclenchées par les boutons."
-    )
-
-    st.write(
-        "Le cache de 180 secondes évite certains "
-        "appels répétés, mais le compteur local "
-        "reste une estimation haute."
-    )
-
-    st.warning(
-        "Ne jamais interpréter une cote ou un "
-        "score d'activité comme une garantie "
-        "de rentabilité."
-    )
+    **Économie d'appels :** aucun rafraîchissement automatique. Le cache évite les
+    requêtes HTTP identiques pendant 180 secondes. Le quota exact est celui du fournisseur.
+    """)
